@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -17,13 +18,28 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/ipv6"
 )
 
 const (
 	hopEvery = time.Second
 	keepFor  = 10 * time.Second
 	bufSize  = 64 << 10
+
+	// client channel probing, all in seconds
+	lookahead = 5  // probe the slot this far ahead
+	aliveFor  = 10 // a datagram this recent means the channel is alive
+	failAfter = 2  // probe unanswered this long means the channel failed
+	maxAge    = 10 // never send on a socket (NAT mapping) older than this
+	keepSec   = int64(keepFor / time.Second)
 )
+
+// zero32 is both the client probe and the server ACK.
+// An app datagram of exactly 32 zero bytes collides with it and is swallowed (accepted, see CLAUDE.md).
+var zero32 [32]byte
+
+func isProbe(b []byte) bool { return bytes.Equal(b, zero32[:]) }
 
 type Config struct {
 	Hosts  []string `json:"hosts"`
@@ -115,8 +131,10 @@ func logErr(what string, err error) {
 // ---- server ----
 
 type path struct {
-	c *net.UDPConn
-	a netip.AddrPort
+	c  *net.UDPConn
+	pc *ipv6.PacketConn
+	a  netip.AddrPort
+	ua *net.UDPAddr // a, preconverted for WriteBatch
 }
 
 // srvLast is where replies go: the socket+peer the latest datagram came in on.
@@ -132,18 +150,24 @@ func runServer(c *Config, s *sched) error {
 	if err != nil {
 		return err
 	}
-	go func() {
-		buf := make([]byte, bufSize)
+	upPC := tune(up)
+	go func() { // target -> client, via the latest path
+		p := newPump()
 		for {
-			n, err := up.Read(buf)
+			n, err := p.read(upPC)
 			if err != nil {
 				logErr("upstream read", err) // e.g. ICMP refused; keep going
 				continue
 			}
-			if p := srvLast.Load(); p != nil {
-				if _, err := p.c.WriteToUDPAddrPort(buf[:n], p.a); err != nil {
-					logErr("reply", err)
-				}
+			dst := srvLast.Load()
+			if dst == nil {
+				continue
+			}
+			for i := 0; i < n; i++ {
+				p.add(i, dst.ua)
+			}
+			if err := p.flush(dst.pc); err != nil {
+				logErr("reply", err)
 			}
 		}
 	}()
@@ -172,29 +196,53 @@ func runServer(c *Config, s *sched) error {
 				continue
 			}
 			open[ap] = conn
-			go serveListener(conn, up)
+			go serveListener(conn, tune(conn), upPC)
 		}
 		time.Sleep(time.Until(now.Truncate(time.Minute).Add(time.Minute)))
 	}
 }
 
-// ponytail: one syscall per datagram, ~200-500k pps per direction; recvmmsg/GSO batching is in CLAUDE.md TODO.
-func serveListener(c *net.UDPConn, up *net.UDPConn) {
-	buf := make([]byte, bufSize)
+func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn) {
+	p := newPump()
 	for {
-		n, from, err := c.ReadFromUDPAddrPort(buf)
+		n, err := p.read(pc)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
 			continue
 		}
-		if p := srvLast.Load(); p == nil || p.c != c || p.a != from {
-			srvLast.Store(&path{c, from})
+		var from *net.UDPAddr // sender of the latest data datagram in this batch
+		for i := 0; i < n; i++ {
+			a, _ := p.in[i].Addr.(*net.UDPAddr)
+			if p.seg[i] == 0 && isProbe(p.buf(i)) {
+				if a != nil {
+					go ack(c, a.AddrPort())
+				}
+				continue
+			}
+			from = a
+			p.add(i, nil)
 		}
-		if _, err := up.Write(buf[:n]); err != nil {
+		if from == nil {
+			continue
+		}
+		if ap := from.AddrPort(); func() bool { l := srvLast.Load(); return l == nil || l.c != c || l.a != ap }() {
+			srvLast.Store(&path{c, pc, ap, from})
+		}
+		if err := p.flush(up); err != nil {
 			logErr("forward", err)
 		}
+	}
+}
+
+// ack answers a probe thrice, 1 s apart. A probe is not data, so srvLast is left untouched.
+func ack(c *net.UDPConn, to netip.AddrPort) {
+	for i := 0; i < 3; i++ {
+		if _, err := c.WriteToUDPAddrPort(zero32[:], to); err != nil {
+			return
+		}
+		time.Sleep(time.Second)
 	}
 }
 
@@ -209,54 +257,170 @@ func runClient(c *Config, s *sched) error {
 	if err != nil {
 		return err
 	}
-	var appPeer atomic.Pointer[netip.AddrPort]
-	var cur atomic.Pointer[net.UDPConn]
+	appPC := tune(app)
+	var appPeer atomic.Pointer[net.UDPAddr]
+	var cur atomic.Pointer[ipv6.PacketConn]
 
-	go func() { // app -> current hop
-		buf := make([]byte, bufSize)
+	go func() { // app -> current channel
+		p := newPump()
 		for {
-			n, from, err := app.ReadFromUDPAddrPort(buf)
-			if err != nil {
+			n, err := p.read(appPC)
+			if err != nil || n == 0 {
 				continue
 			}
-			if p := appPeer.Load(); p == nil || *p != from {
-				appPeer.Store(&from)
-			}
-			if h := cur.Load(); h != nil {
-				if _, err := h.Write(buf[:n]); err != nil {
-					logErr("send", err)
+			if a, _ := p.in[n-1].Addr.(*net.UDPAddr); a != nil {
+				if q := appPeer.Load(); q == nil || q.AddrPort() != a.AddrPort() {
+					appPeer.Store(a)
 				}
+			}
+			h := cur.Load()
+			if h == nil {
+				continue
+			}
+			for i := 0; i < n; i++ {
+				p.add(i, nil)
+			}
+			if err := p.flush(h); err != nil {
+				logErr("send", err)
 			}
 		}
 	}()
 
-	for {
-		now := time.Now()
-		dst := s.hp(now.Unix())
-		h, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(dst)) // fresh source port = fresh NAT mapping
+	// Per-pair channels, owned by this goroutine; readers touch only lastRecv.
+	chans := map[netip.AddrPort]*chanState{}
+
+	// open replaces p's channel with a fresh socket (fresh NAT mapping) and probes it.
+	open := func(p netip.AddrPort, T int64) {
+		h, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(p))
 		if err != nil {
-			logErr("hop "+dst.String(), err) // keep previous hop
-		} else {
-			cur.Store(h)
-			time.AfterFunc(keepFor, func() { h.Close() })
-			go func() { // replies on any live hop -> app
-				buf := make([]byte, bufSize)
-				for {
-					n, err := h.Read(buf)
-					if err != nil {
-						if errors.Is(err, net.ErrClosed) {
-							return
-						}
-						continue
-					}
-					if p := appPeer.Load(); p != nil {
-						app.WriteToUDPAddrPort(buf[:n], *p)
-					}
-				}
-			}()
+			logErr("dial "+p.String(), err)
+			return
 		}
+		if old := chans[p]; old != nil {
+			time.AfterFunc(keepFor, func() { old.conn.Close() }) // let in-flight replies land
+		}
+		st := &chanState{conn: h, pc: tune(h), createdAt: T, probedAt: T, lastUse: T}
+		chans[p] = st
+		go func() { // replies on any live channel -> app
+			p := newPump()
+			for {
+				n, err := p.read(st.pc)
+				if err != nil {
+					if errors.Is(err, net.ErrClosed) {
+						return
+					}
+					continue
+				}
+				st.lastRecv.Store(time.Now().Unix())
+				peer := appPeer.Load()
+				if peer == nil {
+					continue
+				}
+				for i := 0; i < n; i++ {
+					if p.seg[i] == 0 && isProbe(p.buf(i)) {
+						continue // ACK: liveness only
+					}
+					p.add(i, peer)
+				}
+				if err := p.flush(appPC); err != nil {
+					logErr("deliver", err)
+				}
+			}
+		}()
+		if _, err := h.Write(zero32[:]); err != nil {
+			logErr("probe "+p.String(), err)
+		}
+	}
+
+	for first := true; ; first = false {
+		now := time.Now()
+		T := now.Unix()
+
+		// 1. probe the lookahead slot (on startup, every slot up to it)
+		k0 := int64(lookahead)
+		if first {
+			k0 = 0
+		}
+		for k := k0; k <= lookahead; k++ {
+			p := s.hp(T + k)
+			st := chans[p]
+			if st != nil && T+k-st.createdAt < maxAge &&
+				(st.lastRecv.Load() >= T-lookahead || T-st.probedAt < failAfter) {
+				st.lastUse = T // alive or probe pending: reuse
+				continue
+			}
+			open(p, T)
+		}
+
+		// 2. pick the first alive channel in schedule order, else the first not failed, else HP(T)
+		var pick, maybe *chanState
+	scan:
+		for k := int64(0); k <= lookahead; k++ {
+			st := chans[s.hp(T+k)]
+			switch st.status(T) {
+			case alive:
+				pick = st
+				break scan
+			case unknown:
+				if maybe == nil {
+					maybe = st
+				}
+			}
+		}
+		if pick == nil {
+			pick = maybe
+		}
+		if pick == nil {
+			pick = chans[s.hp(T)]
+		}
+		if pick != nil {
+			pick.lastUse = T
+			cur.Store(pick.pc)
+		}
+
+		// 3. close channels unused for keepFor and outside the lookahead window
+		for p, st := range chans {
+			if T-st.lastUse <= keepSec {
+				continue
+			}
+			inWindow := false
+			for k := int64(0); k <= lookahead && !inWindow; k++ {
+				inWindow = s.hp(T+k) == p
+			}
+			if !inWindow {
+				st.conn.Close()
+				delete(chans, p)
+			}
+		}
+
 		time.Sleep(time.Until(now.Truncate(hopEvery).Add(hopEvery)))
 	}
+}
+
+type chanState struct {
+	conn                         *net.UDPConn
+	pc                           *ipv6.PacketConn
+	createdAt, probedAt, lastUse int64        // unix seconds
+	lastRecv                     atomic.Int64 // unix seconds of last datagram (data or ACK)
+}
+
+const (
+	failed = iota
+	unknown
+	alive
+)
+
+func (st *chanState) status(T int64) int {
+	if st == nil || T-st.createdAt >= maxAge {
+		return failed
+	}
+	switch r := st.lastRecv.Load(); {
+	case r >= T-aliveFor:
+		return alive
+	case T-st.probedAt >= failAfter && r < st.probedAt:
+		return failed
+	}
+	return unknown
 }
 
 func main() {

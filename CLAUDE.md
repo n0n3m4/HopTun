@@ -10,7 +10,10 @@ app ⇄ client [listen] ⇄ (hopping UDP) ⇄ server [hosts × ports] ⇄ [targe
 ```
 
 ## Layout
-- `main.go`: everything (config, schedule, server, client). Stdlib only.
+- `main.go`: config, schedule, server, client.
+- `batch.go`: batched UDP I/O (`pump`): recvmmsg/sendmmsg, GRO/GSO, socket tuning. Linux-only.
+- Only dependency: `golang.org/x/net` (`ipv6.PacketConn` batch API). It is pinned at v0.44.0 because newer
+  versions require Go 1.26. Keep `go 1.24` in go.mod.
 - `main_test.go`: loopback end-to-end test (IPv4 + IPv6, asserts echo delivery and observed hopping).
 - `hop.example.json`: sample shared config.
 
@@ -43,9 +46,29 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
   for a wrong host:port. Replies from `target` go out of the socket the **latest** datagram
   arrived on, to the peer it came from (`srvLast`). Host IPs must be configured on the server's
   interfaces.
-- **Client:** every second it opens `DialUDP(HP(now))` and makes that socket current for app→server traffic. Each hop
-  socket stays open for 10 s to receive late replies, then closes. Replies from any live hop go to the last app peer.
-- Hot path: one read and one write per datagram, atomics only (no locks), and no per-packet allocation. The hash runs once per hop.
+- **Probes:** a probe is a datagram of exactly 32 zero bytes. The server never forwards a probe and never updates
+  `srvLast` for one. It answers with the same 32 zero bytes three times, 1 s apart, from the socket the probe
+  arrived on.
+- **Client:** keeps one channel (socket + state) per pair. Each second `T`:
+  1. It probes slot `HP(T+5)` from a fresh socket, which means a fresh NAT mapping. It skips the probe and reuses
+     the existing socket if that socket got a datagram in the last 5 s (or has a probe still pending) and will
+     be younger than `maxAge` (10 s) when its slot comes. On startup it probes every slot from `T` to `T+5`.
+  2. It sends app traffic on the first **alive** channel among `HP(T)`…`HP(T+5)`, meaning one that received a
+     datagram within 10 s. If none is alive, it uses the first channel that has not **failed**, and as a last
+     resort `HP(T)`. A channel has failed if its probe went unanswered for 2 s or if it is older than `maxAge`.
+  3. It closes a channel that has not been used for 10 s and is outside the lookahead window, so late replies
+     still land. Replies from any live channel go to the last app peer. Probe ACKs only refresh the channel's
+     liveness and are never forwarded to the app.
+- Hot path: each reader goroutine owns a `pump`. It reads up to `batchSize` messages per recvmmsg, then sends them
+  with one sendmmsg. It uses atomics only (no locks), and the hash runs once per hop. The one per-packet
+  allocation is the `*net.UDPAddr` that x/net creates for each received message.
+- **GRO→GSO pass-through:** every socket has `UDP_GRO` on, so the kernel can hand over many same-sized datagrams
+  as one buffer plus a segment size. The pump forwards that buffer as one `UDP_SEGMENT` (GSO) send, and the
+  kernel re-splits it, so datagram boundaries are preserved end to end. If a GSO send fails (no checksum offload,
+  segment > MTU, old kernel), that pump logs it once and from then on splits segments itself. Probe detection
+  runs only on non-coalesced datagrams.
+- Socket buffers are 4 MiB (`SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`, falling back to the capped `SO_RCVBUF`/`SO_SNDBUF`).
+  Bursts are dropped when the receive queue is full.
 
 ## Design decisions (do not "fix")
 - **No encryption or authentication.** This is a connection-stability tool, not a protection measure. Run a
@@ -54,22 +77,34 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
 - **Single reply path, no reply fan-out.** Zero (or near-zero) bandwidth overhead is a goal. Replies
   sent during the second a new NAT mapping fails may be lost, which is acceptable under UDP's lossy model.
 - **No discard on wrong host:port** on the server. Clock skew is tolerated, not policed.
+- **Probe = 32 zero bytes, no framing.** An app datagram of exactly 32 zero bytes collides with it and is swallowed.
+  This is accepted, because framing would cost bytes on every packet. The probe traffic is one 32-byte probe per
+  second from the client and up to three 32-byte ACKs per probe from the server.
+- **`maxAge` = 10 s cap on sending over one socket.** Reusing a channel that has proven alive is fine, but
+  long-lived NAT mappings are what buggy NATs kill.
 - Packet reordering at hop boundaries is expected, and the inner protocol must tolerate it.
 
-## TODO (performance)
-- `recvmmsg`/`sendmmsg` batching (`golang.org/x/net/ipv6.PacketConn.ReadBatch/WriteBatch`). Each
-  direction is currently one goroutine (one core) doing one syscall per datagram, which tops out
-  around 200–500k pps.
-- UDP GSO/GRO (`UDP_SEGMENT` / `UDP_GRO`) for large-packet throughput.
+## Performance (measured on loopback, 8 cores, 1200-byte datagrams)
+| Sender | Before batching | After |
+|---|---|---|
+| plain sendto, ~160k pps | 140k pps delivered, 18% loss | 150k pps, 3.8% loss (the sender is the bottleneck) |
+| GSO sender, unthrottled | 143k pps / 1.4 Gbit/s | 733k pps / 7.0 Gbit/s |
+
+Remaining ceiling: each direction is one goroutine (one core). Next steps, only if needed: several readers per
+socket via `SO_REUSEPORT`, and `batchSize` tuning (memory cost: `batchSize` × 64 KiB per reader).
 
 ## Operational notes
+- Without CAP_NET_ADMIN (not root), socket buffers are capped by `net.core.rmem_max`/`wmem_max`, which is often
+  about 208 KiB. Raise them, for example with `sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304`.
+- Kernel: GSO needs Linux 4.18 or newer, and GRO needs 5.0 or newer. Older kernels work without them.
 - Server under high load: every hop creates a new conntrack entry. Use `iptables -t raw … -j NOTRACK` for the port range.
 - Carrier-grade NATs with per-subscriber port quotas see about 30–180 live mappings per client. If
   that becomes a problem, increase `hopEvery` (a constant in `main.go`).
 
 ## Dev
 ```
-go vet ./... && go test -v ./...   # test takes ~4 s, uses ports 47000-47003, 47100-47101
+go vet ./... && go test -v ./...   # ~7 s; ports 47000-47003, 47100-47101; 192.0.2.1 = deliberately dead host
+# tests: TestTunnel (dead pairs, probe leak, GSO burst → 10×100 B), TestClosedReadBatch (readers exit), TestPumpSplit
 CGO_ENABLED=0 go build -o hoptun .   # static binary, no glibc dependency
 ```
 Always build with `CGO_ENABLED=0`. Otherwise `net` links the cgo DNS resolver against the build

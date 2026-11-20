@@ -9,8 +9,16 @@ handshake and no session state. NATs that drop or time out long-lived flows neve
 app ⇄ client [listen] ⇄ (hopping UDP) ⇄ server [hosts × ports] ⇄ [target]
 ```
 
+Before switching, the client probes each upcoming host:port 5 s ahead with a 32-zero-byte datagram, which the
+server acknowledges. Traffic goes only over channels that have proven alive, so dead addresses and blocked ports
+are skipped. As a side effect, an app datagram of exactly 32 zero bytes is treated as a probe and dropped.
+
 It does **not** encrypt or authenticate anything. If you need security, run a secure protocol
 (WireGuard, QUIC, …) inside the tunnel.
+
+It is Linux-only. Traffic is read and written in batches (recvmmsg/sendmmsg), with UDP GRO/GSO when the kernel
+supports them. If you run it as non-root, raise `net.core.rmem_max` and `net.core.wmem_max` (for example to
+4194304) so the 4 MiB socket buffers take effect.
 
 ## Build
 ```sh
