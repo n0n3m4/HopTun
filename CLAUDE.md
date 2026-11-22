@@ -1,7 +1,7 @@
 # hoptun
 
 UDP tunnel for connection stability in roaming and lossy networks. The client hops to a new server
-host:port (and a fresh local source port, hence a fresh NAT mapping) every 100 ms (`hopEvery`), so buggy NATs
+host:port (and a fresh local source port, hence a fresh NAT mapping) every 100 ms by default (`hopEvery`, config `hop_ms`), so buggy NATs
 that drop or time out long-lived flows never get a long-lived flow to break. No handshake, no
 session state: "connectionless connections". Exactly one client and one server.
 
@@ -31,7 +31,8 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
   "ports":  [[40000, 40015]],
   "key":    "shared",
   "target": "127.0.0.1:9000",
-  "listen": "[::1]:5000"
+  "listen": "[::1]:5000",
+  "hop_ms": 100
 }
 ```
 - `hosts` × `ports` (inclusive ranges) form the pair list, in file order. IPv4/IPv6/zoned addresses work.
@@ -42,6 +43,8 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
   UDP-Lite never gets GRO on receive. A pair prints as `host:portl`. That spelling feeds the fingerprint and the
   keystream.
 - `key` perturbs the schedule and keys the obfuscation. It is **not** a security measure.
+- `hop_ms` (optional, default 100) sets `hopEvery`. `setHop` converts the client's wall-clock timings into slots (at least 1).
+  It feeds the fingerprint.
 - `target` is used by the server only (the forward destination); `listen` by the client only (where the local app sends).
 
 ## How it works
@@ -121,7 +124,7 @@ socket via `SO_REUSEPORT`, and `batchSize` tuning (memory cost: `batchSize` × 6
 - Server under high load: every hop creates a new conntrack entry. Use `iptables -t raw … -j NOTRACK` for the port range.
 - Every slot opens a new source port, so a NAT or conntrack sees about 10 new mappings per second, 300–1,800 live
   at typical 30–180 s timeouts. Carrier-grade NATs with per-subscriber port quotas will hit that. If it becomes a
-  problem, increase `hopEvery` (a constant in `main.go`; all timeouts are wall-clock and adapt).
+  problem, increase `hop_ms` (all timeouts are wall-clock and adapt).
 - The server holds about one socket per distinct pair in a 3-minute window (up to 1,800 at 100 ms). Go raises the
   soft `RLIMIT_NOFILE` to the hard limit at startup; make sure the hard limit is high enough.
 

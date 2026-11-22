@@ -29,18 +29,29 @@ import (
 )
 
 const (
-	hopEvery = 100 * time.Millisecond // one schedule slot
-	keepFor  = 10 * time.Second
-	bufSize  = 64 << 10
-
-	// client channel probing, in slots, derived from wall-clock times so they don't depend on hopEvery
-	perSec    = int64(time.Second / hopEvery)
-	lookahead = 5 * perSec  // probe the slot this far ahead
-	aliveFor  = 10 * perSec // a datagram this recent means the channel is alive
-	failAfter = 2 * perSec  // probe unanswered this long means the channel failed
-	maxAge    = 10 * perSec // never send on a socket (NAT mapping) older than this
-	keepSlots = int64(keepFor / hopEvery)
+	keepFor = 10 * time.Second
+	bufSize = 64 << 10
 )
+
+// hopEvery is one schedule slot (config "hop_ms"). The client timings below are wall-clock times
+// converted to slots by setHop, so they don't depend on hopEvery.
+var (
+	hopEvery  time.Duration
+	lookahead int64 // probe the slot this far ahead (5 s)
+	aliveFor  int64 // a datagram this recent means the channel is alive (10 s)
+	failAfter int64 // probe unanswered this long means the channel failed (2 s)
+	maxAge    int64 // never send on a socket (NAT mapping) older than this (10 s)
+	keepSlots int64 // close a channel unused this long (keepFor)
+)
+
+func setHop(d time.Duration) {
+	hopEvery = d
+	lookahead, aliveFor, failAfter, maxAge, keepSlots =
+		slots(5*time.Second), slots(10*time.Second), slots(2*time.Second), slots(10*time.Second), slots(keepFor)
+}
+
+// slots converts a wall-clock time to whole slots, at least 1.
+func slots(d time.Duration) int64 { return max(1, int64(d/hopEvery)) }
 
 // slot is the schedule's clock: hopEvery periods since the Unix epoch (UTC).
 func slot(t time.Time) int64 { return t.UnixNano() / int64(hopEvery) }
@@ -57,6 +68,7 @@ type Config struct {
 	Key    string    `json:"key"`
 	Target string    `json:"target"` // server only: where datagrams are forwarded
 	Listen string    `json:"listen"` // client only: where the local app sends
+	HopMs  int       `json:"hop_ms"` // hop interval in ms, default 100
 }
 
 // port is a config port: a JSON number, or a string with an "l" suffix for UDP-Lite ("40000l").
@@ -114,6 +126,13 @@ func newSched(c *Config) (*sched, error) {
 	if len(c.Hosts) == 0 || len(c.Ports) == 0 {
 		return nil, errors.New("config: hosts and ports must be non-empty")
 	}
+	if c.HopMs < 0 {
+		return nil, errors.New("config: hop_ms must be positive")
+	}
+	if c.HopMs == 0 {
+		c.HopMs = 100
+	}
+	setHop(time.Duration(c.HopMs) * time.Millisecond)
 	var ports []port
 	for _, r := range c.Ports {
 		if r[0].n < 1 || r[1].n > 65535 || r[0].n > r[1].n || r[0].lite != r[1].lite {
@@ -162,6 +181,7 @@ func keystream(key string, p pair) []byte {
 func (s *sched) fingerprint() string {
 	h := md5.New()
 	h.Write([]byte(s.key))
+	fmt.Fprintf(h, "\x00%d", hopEvery.Milliseconds())
 	for _, p := range s.pairs {
 		fmt.Fprintf(h, "\x00%s", p)
 	}
@@ -230,7 +250,7 @@ func runServer(c *Config, s *sched) error {
 		now := time.Now()
 		m := slot(now.Truncate(time.Minute))
 		want := map[pair]bool{}
-		for t := m - 60*perSec; t < m+120*perSec; t++ { // current minute ±1 for clock skew
+		for t := m - slots(time.Minute); t < m+slots(2*time.Minute); t++ { // current minute ±1 for clock skew
 			want[s.hp(t)] = true
 		}
 		for ap, conn := range open {

@@ -35,7 +35,8 @@ Copy the same file to both sides:
   "ports":  [[40000, 40015]],
   "key":    "shared",
   "target": "127.0.0.1:9000",
-  "listen": "[::1]:5000"
+  "listen": "[::1]:5000",
+  "hop_ms": 100
 }
 ```
 - `hosts` × `ports` (inclusive ranges) is the set of server addresses to hop over. The server
@@ -45,6 +46,7 @@ Copy the same file to both sides:
   through firewalls separately (for example `-p udplite` in iptables).
 - `target` is server-only: datagrams are forwarded there.
 - `listen` is client-only: the local app sends here.
+- `hop_ms` (optional, default 100) is the hop interval in milliseconds. Both sides must use the same value.
 - Both sides need clocks synced to within about a minute. Each logs a `schedule fingerprint` at
   startup, and the two must match.
 
