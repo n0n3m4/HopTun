@@ -40,12 +40,12 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
   creates the socket with `syscall` and wraps it with `net.FilePacketConn`, which returns a normal `*net.UDPConn`.
   The kernel refuses GSO sends on UDP-Lite, so coalesced buffers headed to a UDP-Lite socket are split (`add(…, gso=false)`).
   UDP-Lite never gets GRO on receive. A pair prints as `host:portl`. That spelling feeds the fingerprint and the
-  keystream, so plain UDP pairs keep their old values.
+  keystream.
 - `key` perturbs the schedule and keys the obfuscation. It is **not** a security measure.
 - `target` is used by the server only (the forward destination); `listen` by the client only (where the local app sends).
 
 ## How it works
-- **Schedule:** `HP(t) = pairs[FNV-1a(key ‖ uint64be(t)) % len(pairs)]`, `t` = UTC unix seconds. Both sides
+- **Schedule:** `HP(t) = pairs[uint64be(MD5(key ‖ uint64be(t))[:8]) % len(pairs)]`, `t` = UTC unix seconds. Both sides
   must be time-synced to about ±1 minute.
 - **Server:** at each minute boundary it binds every pair in `{HP(t) | t ∈ [minute−60s, minute+120s)}` and
   closes the rest. Every datagram on any open socket is forwarded to `target`, with no filtering
@@ -88,6 +88,9 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
   anyone who can reach a port can inject packets or redirect `srvLast`. That is accepted.
 - **Single reply path, no reply fan-out.** Zero (or near-zero) bandwidth overhead is a goal. Replies
   sent during the second a new NAT mapping fails may be lost, which is acceptable under UDP's lossy model.
+- **No version tags, no extra metadata, period.** Nothing goes into packets (or the wire format) beyond the payload:
+  no version fields, no magic, no framing. The same goes for the fingerprint and similar outputs. Users are assumed to
+  deploy matching builds on both sides; do not add "safety" markers for mismatches.
 - **No discard on wrong host:port** on the server. Clock skew is tolerated, not policed.
 - **Probe = 32 zero bytes, no framing.** An app datagram of exactly 32 zero bytes collides with it and is swallowed.
   This is accepted, because framing would cost bytes on every packet. The probe traffic is one 32-byte probe per
@@ -115,7 +118,7 @@ socket via `SO_REUSEPORT`, and `batchSize` tuning (memory cost: `batchSize` × 6
 
 ## Dev
 ```
-go vet ./... && go test -v ./...   # ~7 s; ports 47000-47002 + 47000l, 47100-47102; 192.0.2.1 = deliberately dead host
+go vet ./... && go test -v ./...   # ~9 s; ports 47000-47003 + 47000l-47001l, 47100-47102; 192.0.2.1 = deliberately dead host
 # tests: TestTunnel (dead pairs, probe leak, GSO burst → 10×100 B intact), TestClosedReadBatch (readers exit),
 #        TestObfuscate (per-pair keystream, per-segment XOR), TestPumpSplit, TestPorts ("l" parsing),
 #        TestLiteSock (real proto-136 socket round trip)

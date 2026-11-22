@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -79,7 +80,7 @@ type pair struct {
 	lite bool
 }
 
-// String is the config spelling. It feeds the fingerprint and the keystream, and plain UDP pairs are unchanged.
+// String is the config spelling ("host:port", "host:portl"). It feeds the fingerprint and the keystream.
 func (p pair) String() string {
 	if p.lite {
 		return p.AddrPort.String() + "l"
@@ -89,16 +90,7 @@ func (p pair) String() string {
 
 type sched struct {
 	pairs []pair
-	seed  uint64 // FNV-1a state after hashing the key
-}
-
-const fnvOffset, fnvPrime = 14695981039346656037, 1099511628211
-
-func fnv(h uint64, b []byte) uint64 {
-	for _, c := range b {
-		h = (h ^ uint64(c)) * fnvPrime
-	}
-	return h
+	key   string
 }
 
 func load(path string) (*Config, *sched, error) {
@@ -127,7 +119,7 @@ func newSched(c *Config) (*sched, error) {
 			ports = append(ports, port{n, r[0].lite})
 		}
 	}
-	s := &sched{seed: fnv(fnvOffset, []byte(c.Key))}
+	s := &sched{key: c.Key}
 	for _, h := range c.Hosts {
 		a, err := netip.ParseAddr(h)
 		if err != nil {
@@ -140,11 +132,13 @@ func newSched(c *Config) (*sched, error) {
 	return s, nil
 }
 
-// hp is the shared schedule: HP(t) for t in UTC unix seconds.
+// hp is the shared schedule: HP(t) for t in UTC unix seconds. MD5 for its avalanche: consecutive t land on
+// unrelated pairs. A linear hash (FNV's last byte, CRC) walks the pair list nearly in order, which puts runs of
+// one host's ports into a single lookahead window.
 func (s *sched) hp(t int64) pair {
-	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], uint64(t))
-	return s.pairs[fnv(s.seed, b[:])%uint64(len(s.pairs))]
+	b := binary.BigEndian.AppendUint64([]byte(s.key), uint64(t))
+	h := md5.Sum(b)
+	return s.pairs[binary.BigEndian.Uint64(h[:8])%uint64(len(s.pairs))]
 }
 
 // keystream obfuscates every datagram on pair ap, probes and ACKs included: AES-128-CTR keyed by
@@ -161,11 +155,12 @@ func keystream(key string, p pair) []byte {
 
 // fingerprint lets operators compare the two sides' startup log lines.
 func (s *sched) fingerprint() string {
-	h := s.seed
+	h := md5.New()
+	h.Write([]byte(s.key))
 	for _, p := range s.pairs {
-		h = fnv(h, []byte(p.String()))
+		fmt.Fprintf(h, "\x00%s", p)
 	}
-	return fmt.Sprintf("%08x", h>>32)
+	return fmt.Sprintf("%x", h.Sum(nil)[:4])
 }
 
 // throttled error log, at most one line per second.

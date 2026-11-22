@@ -16,9 +16,9 @@ import (
 func TestTunnel(t *testing.T) {
 	c := &Config{
 		Hosts: []string{"127.0.0.1", "::1", "192.0.2.1"}, // 192.0.2.1: TEST-NET, unbindable => dead pairs
-		// 47000l: same number, other protocol. Keep the pair count at 12: the schedule walks pairs nearly in order,
-		// so more ports per host would put more than lookahead+1 dead 192.0.2.1 slots in a row.
-		Ports:  [][2]port{{{47000, false}, {47002, false}}, {{47000, true}, {47000, true}}},
+		// 47000l: same number, other protocol. 18 pairs: with the old FNV schedule, which walked pairs nearly in
+		// order, the 6 dead 192.0.2.1 pairs came up back to back and filled the whole lookahead window.
+		Ports:  [][2]port{{{47000, false}, {47003, false}}, {{47000, true}, {47001, true}}},
 		Key:    "test",
 		Target: "127.0.0.1:47100",
 		Listen: "[::1]:47101",
@@ -27,7 +27,7 @@ func TestTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.hp(1700000000) != s.hp(1700000000) || len(s.pairs) != 12 {
+	if s.hp(1700000000) != s.hp(1700000000) || len(s.pairs) != 18 {
 		t.Fatal("schedule not deterministic")
 	}
 
@@ -72,7 +72,7 @@ func TestTunnel(t *testing.T) {
 	}()
 
 	seen := map[string]bool{} // server-side socket+peer paths used
-	const sent = 300
+	const sent = 500          // 5 s: with dead pairs the pick legitimately stays put ~1/3 of hops
 	for i := 0; i < sent; i++ {
 		app.Write([]byte("ping"))
 		time.Sleep(10 * time.Millisecond)
