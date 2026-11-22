@@ -29,17 +29,21 @@ import (
 )
 
 const (
-	hopEvery = time.Second
+	hopEvery = 100 * time.Millisecond // one schedule slot
 	keepFor  = 10 * time.Second
 	bufSize  = 64 << 10
 
-	// client channel probing, all in seconds
-	lookahead = 5  // probe the slot this far ahead
-	aliveFor  = 10 // a datagram this recent means the channel is alive
-	failAfter = 2  // probe unanswered this long means the channel failed
-	maxAge    = 10 // never send on a socket (NAT mapping) older than this
-	keepSec   = int64(keepFor / time.Second)
+	// client channel probing, in slots, derived from wall-clock times so they don't depend on hopEvery
+	perSec    = int64(time.Second / hopEvery)
+	lookahead = 5 * perSec  // probe the slot this far ahead
+	aliveFor  = 10 * perSec // a datagram this recent means the channel is alive
+	failAfter = 2 * perSec  // probe unanswered this long means the channel failed
+	maxAge    = 10 * perSec // never send on a socket (NAT mapping) older than this
+	keepSlots = int64(keepFor / hopEvery)
 )
+
+// slot is the schedule's clock: hopEvery periods since the Unix epoch (UTC).
+func slot(t time.Time) int64 { return t.UnixNano() / int64(hopEvery) }
 
 // zero32 is both the client probe and the server ACK.
 // An app datagram of exactly 32 zero bytes collides with it and is swallowed (accepted, see CLAUDE.md).
@@ -132,7 +136,7 @@ func newSched(c *Config) (*sched, error) {
 	return s, nil
 }
 
-// hp is the shared schedule: HP(t) for t in UTC unix seconds. MD5 for its avalanche: consecutive t land on
+// hp is the shared schedule: HP(t) for slot t. MD5 for its avalanche: consecutive t land on
 // unrelated pairs. A linear hash (FNV's last byte, CRC) walks the pair list nearly in order, which puts runs of
 // one host's ports into a single lookahead window.
 func (s *sched) hp(t int64) pair {
@@ -144,11 +148,12 @@ func (s *sched) hp(t int64) pair {
 // keystream obfuscates every datagram on pair ap, probes and ACKs included: AES-128-CTR keyed by
 // SHA-256(key ‖ p) with a fixed zero IV, so there are no per-packet bytes. Obfuscation against DPI, not security:
 // the keystream repeats for every packet on the pair (see CLAUDE.md).
-// ponytail: bufSize (64 KiB) per pair, about 11 MiB for a server with 180 listeners.
+// It is ksLen long and repeats for longer datagrams, so it covers every MTU-sized datagram once and costs 2 KiB
+// per socket, even for a server with thousands of listeners.
 func keystream(key string, p pair) []byte {
 	k := sha256.Sum256([]byte(key + "\x00" + p.String()))
 	b, _ := aes.NewCipher(k[:16]) // cannot fail for a 16-byte key
-	ks := make([]byte, bufSize)
+	ks := make([]byte, ksLen)
 	cipher.NewCTR(b, make([]byte, aes.BlockSize)).XORKeyStream(ks, ks)
 	return ks
 }
@@ -223,9 +228,9 @@ func runServer(c *Config, s *sched) error {
 	open := map[pair]*net.UDPConn{}
 	for {
 		now := time.Now()
-		m := now.Truncate(time.Minute).Unix()
+		m := slot(now.Truncate(time.Minute))
 		want := map[pair]bool{}
-		for t := m - 60; t < m+120; t++ { // current minute ±1 for clock skew
+		for t := m - 60*perSec; t < m+120*perSec; t++ { // current minute ±1 for clock skew
 			want[s.hp(t)] = true
 		}
 		for ap, conn := range open {
@@ -251,37 +256,39 @@ func runServer(c *Config, s *sched) error {
 }
 
 func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn, ks []byte, lite bool) {
-	p := newPump()
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return
+	}
 	for {
-		n, err := p.read(pc)
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
+		if err := recv(rc, pc, func(p *pump, n int) { serveBatch(p, n, c, pc, up, ks, lite) }); errors.Is(err, net.ErrClosed) {
+			return
+		}
+	}
+}
+
+func serveBatch(p *pump, n int, c *net.UDPConn, pc, up *ipv6.PacketConn, ks []byte, lite bool) {
+	var from *net.UDPAddr // sender of the latest data datagram in this batch
+	for i := 0; i < n; i++ {
+		a, _ := p.in[i].Addr.(*net.UDPAddr)
+		p.xor(i, ks)
+		if p.seg[i] == 0 && isProbe(p.buf(i)) {
+			if a != nil {
+				go ack(c, a.AddrPort(), ks[:len(zero32)])
 			}
 			continue
 		}
-		var from *net.UDPAddr // sender of the latest data datagram in this batch
-		for i := 0; i < n; i++ {
-			a, _ := p.in[i].Addr.(*net.UDPAddr)
-			p.xor(i, ks)
-			if p.seg[i] == 0 && isProbe(p.buf(i)) {
-				if a != nil {
-					go ack(c, a.AddrPort(), ks[:len(zero32)])
-				}
-				continue
-			}
-			from = a
-			p.add(i, nil, true)
-		}
-		if from == nil {
-			continue
-		}
-		if ap := from.AddrPort(); func() bool { l := srvLast.Load(); return l == nil || l.c != c || l.a != ap }() {
-			srvLast.Store(&path{c, pc, ap, from, ks, lite})
-		}
-		if err := p.flush(up); err != nil {
-			logErr("forward", err)
-		}
+		from = a
+		p.add(i, nil, true)
+	}
+	if from == nil {
+		return
+	}
+	if ap := from.AddrPort(); func() bool { l := srvLast.Load(); return l == nil || l.c != c || l.a != ap }() {
+		srvLast.Store(&path{c, pc, ap, from, ks, lite})
+	}
+	if err := p.flush(up); err != nil {
+		logErr("forward", err)
 	}
 }
 
@@ -353,29 +360,13 @@ func runClient(c *Config, s *sched) error {
 		st := &chanState{p: p, conn: h, pc: tune(h), ks: keystream(c.Key, p), createdAt: T, probedAt: T, lastUse: T}
 		chans[p] = st
 		go func() { // replies on any live channel -> app
-			p := newPump()
+			rc, err := h.SyscallConn()
+			if err != nil {
+				return
+			}
 			for {
-				n, err := p.read(st.pc)
-				if err != nil {
-					if errors.Is(err, net.ErrClosed) {
-						return
-					}
-					continue
-				}
-				st.lastRecv.Store(time.Now().Unix())
-				peer := appPeer.Load()
-				if peer == nil {
-					continue
-				}
-				for i := 0; i < n; i++ {
-					p.xor(i, st.ks)
-					if p.seg[i] == 0 && isProbe(p.buf(i)) {
-						continue // ACK: liveness only
-					}
-					p.add(i, peer, true)
-				}
-				if err := p.flush(appPC); err != nil {
-					logErr("deliver", err)
+				if err := recv(rc, st.pc, func(p *pump, n int) { deliver(p, n, st, appPeer.Load(), appPC) }); errors.Is(err, net.ErrClosed) {
+					return
 				}
 			}
 		}()
@@ -386,7 +377,15 @@ func runClient(c *Config, s *sched) error {
 
 	for first := true; ; first = false {
 		now := time.Now()
-		T := now.Unix()
+		T := slot(now)
+
+		// the lookahead window HP(T)…HP(T+lookahead), hashed once per slot
+		win := make([]pair, lookahead+1)
+		inWin := make(map[pair]bool, len(win))
+		for k := range win {
+			win[k] = s.hp(T + int64(k))
+			inWin[win[k]] = true
+		}
 
 		// 1. probe the lookahead slot (on startup, every slot up to it)
 		k0 := int64(lookahead)
@@ -394,7 +393,7 @@ func runClient(c *Config, s *sched) error {
 			k0 = 0
 		}
 		for k := k0; k <= lookahead; k++ {
-			p := s.hp(T + k)
+			p := win[k]
 			st := chans[p]
 			if st != nil && T+k-st.createdAt < maxAge &&
 				(st.lastRecv.Load() >= T-lookahead || T-st.probedAt < failAfter) {
@@ -407,8 +406,8 @@ func runClient(c *Config, s *sched) error {
 		// 2. pick the first alive channel in schedule order, else the first not failed, else HP(T)
 		var pick, maybe *chanState
 	scan:
-		for k := int64(0); k <= lookahead; k++ {
-			st := chans[s.hp(T+k)]
+		for _, p := range win {
+			st := chans[p]
 			switch st.status(T) {
 			case alive:
 				pick = st
@@ -423,7 +422,7 @@ func runClient(c *Config, s *sched) error {
 			pick = maybe
 		}
 		if pick == nil {
-			pick = chans[s.hp(T)]
+			pick = chans[win[0]]
 		}
 		if pick != nil {
 			pick.lastUse = T
@@ -432,14 +431,7 @@ func runClient(c *Config, s *sched) error {
 
 		// 3. close channels unused for keepFor and outside the lookahead window
 		for p, st := range chans {
-			if T-st.lastUse <= keepSec {
-				continue
-			}
-			inWindow := false
-			for k := int64(0); k <= lookahead && !inWindow; k++ {
-				inWindow = s.hp(T+k) == p
-			}
-			if !inWindow {
+			if T-st.lastUse > keepSlots && !inWin[p] {
 				st.conn.Close()
 				delete(chans, p)
 			}
@@ -449,13 +441,31 @@ func runClient(c *Config, s *sched) error {
 	}
 }
 
+// deliver forwards a batch received on channel st to the app. Probe ACKs only refresh liveness.
+func deliver(p *pump, n int, st *chanState, peer *net.UDPAddr, appPC *ipv6.PacketConn) {
+	st.lastRecv.Store(slot(time.Now()))
+	if peer == nil {
+		return
+	}
+	for i := 0; i < n; i++ {
+		p.xor(i, st.ks)
+		if p.seg[i] == 0 && isProbe(p.buf(i)) {
+			continue // ACK: liveness only
+		}
+		p.add(i, peer, true)
+	}
+	if err := p.flush(appPC); err != nil {
+		logErr("deliver", err)
+	}
+}
+
 type chanState struct {
 	p                            pair
 	conn                         *net.UDPConn
 	pc                           *ipv6.PacketConn
 	ks                           []byte       // keystream of the channel's pair
-	createdAt, probedAt, lastUse int64        // unix seconds
-	lastRecv                     atomic.Int64 // unix seconds of last datagram (data or ACK)
+	createdAt, probedAt, lastUse int64        // slots
+	lastRecv                     atomic.Int64 // slot of the last datagram (data or ACK)
 }
 
 const (

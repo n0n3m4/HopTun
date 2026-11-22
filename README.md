@@ -1,6 +1,6 @@
 # HopTun
 
-A UDP tunnel for connection stability in roaming and lossy networks. Every second, the client
+A UDP tunnel for connection stability in roaming and lossy networks. Every 100 ms, the client
 hops to a new server host:port, using a fresh local source port and therefore a fresh NAT
 mapping. Both sides compute the hops from UTC time and a shared config, so there is no
 handshake and no session state. NATs that drop or time out long-lived flows never see one.

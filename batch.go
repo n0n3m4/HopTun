@@ -8,10 +8,12 @@ package main
 import (
 	"crypto/subtle"
 	"encoding/binary"
+	"errors"
 	"log"
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -28,7 +30,47 @@ const (
 	udpSegment = 103     // UDP_SEGMENT (GSO), Linux ≥ 4.18
 	udpGRO     = 104     // UDP_GRO, Linux ≥ 5.0
 	protoLite  = 136     // IPPROTO_UDPLITE
+	ksLen      = 2 << 10 // keystream length; longer datagrams reuse it cyclically
 )
+
+// pumps lends batch buffers (batchSize × 64 KiB each) to per-pair readers only while they have data, so buffer
+// memory follows busy sockets, not open ones. That matters with ~150 client channels and thousands of server
+// listeners at 100 ms hops.
+var pumps = sync.Pool{New: func() any { return newPump() }}
+
+// recv waits until c is readable while holding no buffers, then reads one batch into a pooled pump and hands it
+// to f. The pump goes back to the pool when f returns. A closed socket returns an error that wraps net.ErrClosed.
+func recv(rc syscall.RawConn, pc *ipv6.PacketConn, f func(p *pump, n int)) error {
+	var perr error
+	if err := rc.Read(func(fd uintptr) bool {
+		_, _, e := syscall.Recvfrom(int(fd), nil, syscall.MSG_PEEK|syscall.MSG_DONTWAIT) // 0-byte peek: data queued?
+		if e == syscall.EAGAIN {
+			return false // park in the poller until readable
+		}
+		perr = e // nil (data) or a pending socket error such as ECONNREFUSED, which the peek consumed
+		return true
+	}); err != nil {
+		return err
+	}
+	if perr != nil {
+		return perr
+	}
+	p := pumps.Get().(*pump)
+	defer pumps.Put(p)
+	for flags := 0; ; flags = syscall.MSG_DONTWAIT { // after a full batch, more is likely: read again, no peek
+		n, err := p.readFlags(pc, flags)
+		if err != nil {
+			if flags != 0 && errors.Is(err, syscall.EAGAIN) {
+				return nil // drained
+			}
+			return err
+		}
+		f(p, n)
+		if n < len(p.in) {
+			return nil
+		}
+	}
+}
 
 // udpSock opens p's socket, bound (listen) or connected (dial). For UDP-Lite, which package net lacks, it makes the
 // socket by hand and wraps it with FilePacketConn, which still returns a *net.UDPConn. UDP-Lite keeps the default
@@ -121,9 +163,11 @@ func newPump() *pump {
 	return p
 }
 
-func (p *pump) read(c *ipv6.PacketConn) (int, error) {
+func (p *pump) read(c *ipv6.PacketConn) (int, error) { return p.readFlags(c, 0) }
+
+func (p *pump) readFlags(c *ipv6.PacketConn, flags int) (int, error) {
 	p.out = p.out[:0]
-	n, err := c.ReadBatch(p.in, 0)
+	n, err := c.ReadBatch(p.in, flags)
 	for i := 0; i < n; i++ {
 		p.seg[i] = groSize(p.in[i].OOB[:p.in[i].NN])
 	}
@@ -141,7 +185,9 @@ func (p *pump) xor(i int, ks []byte) {
 	}
 	for len(b) > 0 {
 		n := min(s, len(b))
-		subtle.XORBytes(b[:n], b[:n], ks)
+		for d := b[:n]; len(d) > 0; d = d[min(len(ks), len(d)):] { // datagrams longer than ks repeat it
+			subtle.XORBytes(d, d, ks)
+		}
 		b = b[n:]
 	}
 }

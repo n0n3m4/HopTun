@@ -175,7 +175,14 @@ func TestClosedReadBatch(t *testing.T) { // readers rely on this to exit instead
 		t.Fatal(err)
 	}
 	pc := tune(c)
+	rc, _ := c.SyscallConn()
+	done := make(chan error)
+	go func() { done <- recv(rc, pc, func(*pump, int) {}) }() // parked in the poller, holding no pump
+	time.Sleep(50 * time.Millisecond)
 	c.Close()
+	if err := <-done; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("recv on closed socket: %v, want net.ErrClosed", err)
+	}
 	if _, err := newPump().read(pc); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("ReadBatch on closed socket: %v, want net.ErrClosed", err)
 	}
@@ -199,6 +206,11 @@ func TestObfuscate(t *testing.T) { // per-pair keystreams; a GRO buffer is (de)o
 	if !bytes.Equal(p.buf(0), make([]byte, 250)) {
 		t.Fatal("xor twice is not identity")
 	}
+	p.in[0].N, p.seg[0] = ksLen+100, 0 // one datagram longer than the keystream: it repeats
+	p.xor(0, ka)
+	if !bytes.Equal(p.buf(0)[ksLen:], ka[:100]) {
+		t.Fatal("keystream does not repeat past ksLen")
+	}
 }
 
 func TestPumpSplit(t *testing.T) { // coalesced buffer: GSO keeps it whole, the noGSO fallback splits on segment boundaries
@@ -217,5 +229,23 @@ func TestPumpSplit(t *testing.T) { // coalesced buffer: GSO keeps it whole, the 
 	p.add(0, nil, true)
 	if len(p.out) != 3 || len(p.out[0].Buffers[0]) != 100 || len(p.out[2].Buffers[0]) != 50 || p.out[1].OOB != nil {
 		t.Fatalf("split: %d msgs", len(p.out))
+	}
+}
+
+func TestRecvDrain(t *testing.T) { // full batches are re-read without the peek, and the drained queue does not block
+	l, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	pc := tune(l)
+	d, _ := net.DialUDP("udp", nil, l.LocalAddr().(*net.UDPAddr))
+	for i := 0; i < 3*batchSize+3; i++ {
+		d.Write([]byte{byte(i), 1, 2})
+	}
+	rc, _ := l.SyscallConn()
+	got := 0
+	if err := recv(rc, pc, func(p *pump, n int) { got += n }); err != nil || got != 3*batchSize+3 {
+		t.Fatalf("recv: %d datagrams, %v; want %d", got, err, 3*batchSize+3)
 	}
 }

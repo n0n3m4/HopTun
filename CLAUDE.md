@@ -1,7 +1,7 @@
 # hoptun
 
 UDP tunnel for connection stability in roaming and lossy networks. The client hops to a new server
-host:port (and a fresh local source port, hence a fresh NAT mapping) every second, so buggy NATs
+host:port (and a fresh local source port, hence a fresh NAT mapping) every 100 ms (`hopEvery`), so buggy NATs
 that drop or time out long-lived flows never get a long-lived flow to break. No handshake, no
 session state: "connectionless connections". Exactly one client and one server.
 
@@ -45,7 +45,7 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
 - `target` is used by the server only (the forward destination); `listen` by the client only (where the local app sends).
 
 ## How it works
-- **Schedule:** `HP(t) = pairs[uint64be(MD5(key ‖ uint64be(t))[:8]) % len(pairs)]`, `t` = UTC unix seconds. Both sides
+- **Schedule:** `HP(t) = pairs[uint64be(MD5(key ‖ uint64be(t))[:8]) % len(pairs)]`, `t` = slot = UTC unix time / `hopEvery` (100 ms). Both sides
   must be time-synced to about ±1 minute.
 - **Server:** at each minute boundary it binds every pair in `{HP(t) | t ∈ [minute−60s, minute+120s)}` and
   closes the rest. Every datagram on any open socket is forwarded to `target`, with no filtering
@@ -53,25 +53,31 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
   arrived on, to the peer it came from (`srvLast`). Host IPs must be configured on the server's
   interfaces.
 - **Obfuscation:** every datagram on the wire (data, probes, ACKs) is XORed with a per-pair keystream:
-  AES-128-CTR, key `SHA-256(key ‖ 0x00 ‖ "host:port")[:16]`, fixed zero IV, computed once per socket (64 KiB).
+  AES-128-CTR, key `SHA-256(key ‖ 0x00 ‖ "host:port")[:16]`, fixed zero IV, computed once per socket (`ksLen` = 2 KiB, repeated for datagrams longer than that).
   Every datagram (each GRO segment too) starts at keystream offset 0. Zero bytes added. It is meant only to defeat
   DPI that matches inner-protocol headers. Because the keystream repeats, XORing two packets from the same pair
   cancels it, and packet lengths are unchanged.
 - **Probes:** a probe is a datagram of exactly 32 zero bytes (before obfuscation). The server never forwards a probe and never updates
   `srvLast` for one. It answers with the same 32 zero bytes three times, 1 s apart, from the socket the probe
   arrived on.
-- **Client:** keeps one channel (socket + state) per pair. Each second `T`:
-  1. It probes slot `HP(T+5)` from a fresh socket, which means a fresh NAT mapping. It skips the probe and reuses
+- **Client:** keeps one channel (socket + state) per pair. Every slot `T` (100 ms), with all times below converted
+  to slots (`perSec` = 10):
+  1. It probes slot `HP(T+5 s)` from a fresh socket, which means a fresh NAT mapping. It skips the probe and reuses
      the existing socket if that socket got a datagram in the last 5 s (or has a probe still pending) and will
-     be younger than `maxAge` (10 s) when its slot comes. On startup it probes every slot from `T` to `T+5`.
-  2. It sends app traffic on the first **alive** channel among `HP(T)`…`HP(T+5)`, meaning one that received a
+     be younger than `maxAge` (10 s) when its slot comes. On startup it probes every slot from `T` to `T+5 s`.
+  2. It sends app traffic on the first **alive** channel among `HP(T)`…`HP(T+5 s)`, meaning one that received a
      datagram within 10 s. If none is alive, it uses the first channel that has not **failed**, and as a last
      resort `HP(T)`. A channel has failed if its probe went unanswered for 2 s or if it is older than `maxAge`.
   3. It closes a channel that has not been used for 10 s and is outside the lookahead window, so late replies
      still land. Replies from any live channel go to the last app peer. Probe ACKs only refresh the channel's
      liveness and are never forwarded to the app.
-- Hot path: each reader goroutine owns a `pump`. It reads up to `batchSize` messages per recvmmsg, then sends them
-  with one sendmmsg. It uses atomics only (no locks), and the hash runs once per hop. The one per-packet
+- **Memory follows busy sockets, not open ones.** At 100 ms the client holds about 150 channels and the server
+  about 1,500 listeners (4,000 pairs). Per-pair readers (`recv`) park in Go's poller holding no buffers (a 0-byte
+  `MSG_PEEK` checks for data) and borrow a `pump` from a `sync.Pool` only while they have data. After a full batch,
+  they re-read with `MSG_DONTWAIT` and skip the peek. The app and upstream readers keep their own pump. Measured with
+  4,000 pairs: server about 20 MB RSS, client about 14 MB, under 1% CPU each at light load.
+- Hot path: each reader goroutine owns a `pump` while it reads. It reads up to `batchSize` messages per recvmmsg, then sends them
+  with one sendmmsg. It uses atomics only (no locks). The client hashes its lookahead window once per slot. The one per-packet
   allocation is the `*net.UDPAddr` that x/net creates for each received message.
 - **GRO→GSO pass-through:** every socket has `UDP_GRO` on, so the kernel can hand over many same-sized datagrams
   as one buffer plus a segment size. The pump forwards that buffer as one `UDP_SEGMENT` (GSO) send, and the
@@ -87,14 +93,14 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
   secure protocol (WireGuard, QUIC, TLS…) inside the tunnel if needed. As a consequence,
   anyone who can reach a port can inject packets or redirect `srvLast`. That is accepted.
 - **Single reply path, no reply fan-out.** Zero (or near-zero) bandwidth overhead is a goal. Replies
-  sent during the second a new NAT mapping fails may be lost, which is acceptable under UDP's lossy model.
+  sent during the slot a new NAT mapping fails may be lost, which is acceptable under UDP's lossy model.
 - **No version tags, no extra metadata, period.** Nothing goes into packets (or the wire format) beyond the payload:
   no version fields, no magic, no framing. The same goes for the fingerprint and similar outputs. Users are assumed to
   deploy matching builds on both sides; do not add "safety" markers for mismatches.
 - **No discard on wrong host:port** on the server. Clock skew is tolerated, not policed.
 - **Probe = 32 zero bytes, no framing.** An app datagram of exactly 32 zero bytes collides with it and is swallowed.
   This is accepted, because framing would cost bytes on every packet. The probe traffic is one 32-byte probe per
-  second from the client and up to three 32-byte ACKs per probe from the server.
+  slot (10/s) from the client and up to three 32-byte ACKs per probe from the server.
 - **`maxAge` = 10 s cap on sending over one socket.** Reusing a channel that has proven alive is fine, but
   long-lived NAT mappings are what buggy NATs kill.
 - Packet reordering at hop boundaries is expected, and the inner protocol must tolerate it.
@@ -113,8 +119,11 @@ socket via `SO_REUSEPORT`, and `batchSize` tuning (memory cost: `batchSize` × 6
   about 208 KiB. Raise them, for example with `sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304`.
 - Kernel: GSO needs Linux 4.18 or newer, and GRO needs 5.0 or newer. Older kernels work without them.
 - Server under high load: every hop creates a new conntrack entry. Use `iptables -t raw … -j NOTRACK` for the port range.
-- Carrier-grade NATs with per-subscriber port quotas see about 30–180 live mappings per client. If
-  that becomes a problem, increase `hopEvery` (a constant in `main.go`).
+- Every slot opens a new source port, so a NAT or conntrack sees about 10 new mappings per second, 300–1,800 live
+  at typical 30–180 s timeouts. Carrier-grade NATs with per-subscriber port quotas will hit that. If it becomes a
+  problem, increase `hopEvery` (a constant in `main.go`; all timeouts are wall-clock and adapt).
+- The server holds about one socket per distinct pair in a 3-minute window (up to 1,800 at 100 ms). Go raises the
+  soft `RLIMIT_NOFILE` to the hard limit at startup; make sure the hard limit is high enough.
 
 ## Dev
 ```
@@ -124,7 +133,8 @@ go vet ./... && go test -v ./...   # ~9 s; ports 47000-47003 + 47000l-47001l, 47
 #        TestLiteSock (real proto-136 socket round trip)
 CGO_ENABLED=0 go build -o hoptun .   # static binary, no glibc dependency
 ```
-Always build with `CGO_ENABLED=0`. Otherwise `net` links the cgo DNS resolver against the build
-host's glibc, and the binary fails on older systems with "GLIBC_2.xx not found".
+**After every code change, rebuild `./hoptun`** with the command above, so the binary in the repo root always matches
+the source. A stale binary is easy to deploy by mistake.
+Always build with `CGO_ENABLED=0`. Otherwise `net` links the cgo DNS resolver against the build host's glibc, and the binary fails on older systems with "GLIBC_2.xx not found".
 Manual: `socat UDP-LISTEN:9000,fork EXEC:cat` as the target, then run the server and client with
 `hop.example.json`, then `nc -u ::1 5000`. Watch the hops with `ss -uanp`.
