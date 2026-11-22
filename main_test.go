@@ -54,7 +54,7 @@ func TestTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := make(chan int, 1000) // sizes of datagrams echoed back to the app
+	got := make(chan []byte, 1000) // datagrams echoed back to the app
 	go func() {
 		buf := make([]byte, bufSize)
 		for {
@@ -62,7 +62,7 @@ func TestTunnel(t *testing.T) {
 			if err != nil {
 				return
 			}
-			got <- n
+			got <- append([]byte(nil), buf[:n]...)
 		}
 	}()
 
@@ -88,7 +88,7 @@ func TestTunnel(t *testing.T) {
 	t.Logf("echoed %d/%d over %d paths: %v", len(got), sent, len(seen), seen)
 
 	// GSO burst from the app: 10 segments of 100 bytes in one sendmsg. It has to reach the echo target and come
-	// back as 10 separate 100-byte datagrams, whether or not GRO/GSO is used along the way.
+	// back as 10 separate, intact 100-byte datagrams, whether or not GRO/GSO is used along the way.
 	for len(got) > 0 {
 		<-got
 	}
@@ -104,8 +104,8 @@ func TestTunnel(t *testing.T) {
 		t.Fatalf("GSO burst: got %d datagrams back, want 10", n)
 	}
 	for i := 0; i < 10; i++ {
-		if n := <-got; n != 100 {
-			t.Fatalf("GSO burst: datagram of %d bytes, want 100", n)
+		if b := <-got; !bytes.Equal(b, burst[i*100:(i+1)*100]) {
+			t.Fatalf("GSO burst: datagram %d is %d bytes %x..., want 100 bytes of %02x", i, len(b), b[:min(4, len(b))], i+1)
 		}
 	}
 }
@@ -119,6 +119,26 @@ func TestClosedReadBatch(t *testing.T) { // readers rely on this to exit instead
 	c.Close()
 	if _, err := newPump().read(pc); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("ReadBatch on closed socket: %v, want net.ErrClosed", err)
+	}
+}
+
+func TestObfuscate(t *testing.T) { // per-pair keystreams; a GRO buffer is (de)obfuscated per segment
+	a, b := netip.MustParseAddrPort("127.0.0.1:1"), netip.MustParseAddrPort("127.0.0.1:2")
+	ka, kb := keystream("k", a), keystream("k", b)
+	if bytes.Equal(ka[:32], kb[:32]) || bytes.Equal(ka[:32], zero32[:]) {
+		t.Fatal("keystreams must differ per pair and from zero")
+	}
+	p := newPump()
+	p.in[0].N, p.seg[0] = 250, 100
+	p.xor(0, ka)
+	for off := 0; off < 250; off += 100 {
+		if !bytes.Equal(p.buf(0)[off:min(off+100, 250)], ka[:min(100, 250-off)]) {
+			t.Fatalf("segment at %d not obfuscated from keystream offset 0", off)
+		}
+	}
+	p.xor(0, ka)
+	if !bytes.Equal(p.buf(0), make([]byte, 250)) {
+		t.Fatal("xor twice is not identity")
 	}
 }
 

@@ -35,7 +35,7 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
 }
 ```
 - `hosts` × `ports` (inclusive ranges) form the pair list, in file order. IPv4/IPv6/zoned addresses work.
-- `key` only perturbs the schedule. It is **not** a security measure.
+- `key` perturbs the schedule and keys the obfuscation. It is **not** a security measure.
 - `target` is used by the server only (the forward destination); `listen` by the client only (where the local app sends).
 
 ## How it works
@@ -46,7 +46,12 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
   for a wrong host:port. Replies from `target` go out of the socket the **latest** datagram
   arrived on, to the peer it came from (`srvLast`). Host IPs must be configured on the server's
   interfaces.
-- **Probes:** a probe is a datagram of exactly 32 zero bytes. The server never forwards a probe and never updates
+- **Obfuscation:** every datagram on the wire (data, probes, ACKs) is XORed with a per-pair keystream:
+  AES-128-CTR, key `SHA-256(key ‖ 0x00 ‖ "host:port")[:16]`, fixed zero IV, computed once per socket (64 KiB).
+  Every datagram (each GRO segment too) starts at keystream offset 0. Zero bytes added. It is meant only to defeat
+  DPI that matches inner-protocol headers. Because the keystream repeats, XORing two packets from the same pair
+  cancels it, and packet lengths are unchanged.
+- **Probes:** a probe is a datagram of exactly 32 zero bytes (before obfuscation). The server never forwards a probe and never updates
   `srvLast` for one. It answers with the same 32 zero bytes three times, 1 s apart, from the socket the probe
   arrived on.
 - **Client:** keeps one channel (socket + state) per pair. Each second `T`:
@@ -71,7 +76,8 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
   Bursts are dropped when the receive queue is full.
 
 ## Design decisions (do not "fix")
-- **No encryption or authentication.** This is a connection-stability tool, not a protection measure. Run a
+- **No real encryption or authentication.** This is a connection-stability tool, not a protection measure. The
+  fixed-IV obfuscation is deliberate: it costs no bytes per packet, and DPI resistance is its only purpose. Run a
   secure protocol (WireGuard, QUIC, TLS…) inside the tunnel if needed. As a consequence,
   anyone who can reach a port can inject packets or redirect `srvLast`. That is accepted.
 - **Single reply path, no reply fan-out.** Zero (or near-zero) bandwidth overhead is a goal. Replies
@@ -104,7 +110,8 @@ socket via `SO_REUSEPORT`, and `batchSize` tuning (memory cost: `batchSize` × 6
 ## Dev
 ```
 go vet ./... && go test -v ./...   # ~7 s; ports 47000-47003, 47100-47101; 192.0.2.1 = deliberately dead host
-# tests: TestTunnel (dead pairs, probe leak, GSO burst → 10×100 B), TestClosedReadBatch (readers exit), TestPumpSplit
+# tests: TestTunnel (dead pairs, probe leak, GSO burst → 10×100 B intact), TestClosedReadBatch (readers exit),
+#        TestObfuscate (per-pair keystream, per-segment XOR), TestPumpSplit
 CGO_ENABLED=0 go build -o hoptun .   # static binary, no glibc dependency
 ```
 Always build with `CGO_ENABLED=0`. Otherwise `net` links the cgo DNS resolver against the build

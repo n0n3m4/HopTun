@@ -7,6 +7,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -109,6 +112,18 @@ func (s *sched) hp(t int64) netip.AddrPort {
 	return s.pairs[fnv(s.seed, b[:])%uint64(len(s.pairs))]
 }
 
+// keystream obfuscates every datagram on pair ap, probes and ACKs included: AES-128-CTR keyed by
+// SHA-256(key ‖ ap) with a fixed zero IV, so there are no per-packet bytes. Obfuscation against DPI, not security:
+// the keystream repeats for every packet on the pair (see CLAUDE.md).
+// ponytail: bufSize (64 KiB) per pair, about 11 MiB for a server with 180 listeners.
+func keystream(key string, ap netip.AddrPort) []byte {
+	k := sha256.Sum256([]byte(key + "\x00" + ap.String()))
+	b, _ := aes.NewCipher(k[:16]) // cannot fail for a 16-byte key
+	ks := make([]byte, bufSize)
+	cipher.NewCTR(b, make([]byte, aes.BlockSize)).XORKeyStream(ks, ks)
+	return ks
+}
+
 // fingerprint lets operators compare the two sides' startup log lines.
 func (s *sched) fingerprint() string {
 	h := s.seed
@@ -135,6 +150,7 @@ type path struct {
 	pc *ipv6.PacketConn
 	a  netip.AddrPort
 	ua *net.UDPAddr // a, preconverted for WriteBatch
+	ks []byte       // keystream of the listener's pair
 }
 
 // srvLast is where replies go: the socket+peer the latest datagram came in on.
@@ -164,6 +180,7 @@ func runServer(c *Config, s *sched) error {
 				continue
 			}
 			for i := 0; i < n; i++ {
+				p.xor(i, dst.ks)
 				p.add(i, dst.ua)
 			}
 			if err := p.flush(dst.pc); err != nil {
@@ -196,13 +213,13 @@ func runServer(c *Config, s *sched) error {
 				continue
 			}
 			open[ap] = conn
-			go serveListener(conn, tune(conn), upPC)
+			go serveListener(conn, tune(conn), upPC, keystream(c.Key, ap))
 		}
 		time.Sleep(time.Until(now.Truncate(time.Minute).Add(time.Minute)))
 	}
 }
 
-func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn) {
+func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn, ks []byte) {
 	p := newPump()
 	for {
 		n, err := p.read(pc)
@@ -215,9 +232,10 @@ func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn) {
 		var from *net.UDPAddr // sender of the latest data datagram in this batch
 		for i := 0; i < n; i++ {
 			a, _ := p.in[i].Addr.(*net.UDPAddr)
+			p.xor(i, ks)
 			if p.seg[i] == 0 && isProbe(p.buf(i)) {
 				if a != nil {
-					go ack(c, a.AddrPort())
+					go ack(c, a.AddrPort(), ks[:len(zero32)])
 				}
 				continue
 			}
@@ -228,7 +246,7 @@ func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn) {
 			continue
 		}
 		if ap := from.AddrPort(); func() bool { l := srvLast.Load(); return l == nil || l.c != c || l.a != ap }() {
-			srvLast.Store(&path{c, pc, ap, from})
+			srvLast.Store(&path{c, pc, ap, from, ks})
 		}
 		if err := p.flush(up); err != nil {
 			logErr("forward", err)
@@ -237,9 +255,10 @@ func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn) {
 }
 
 // ack answers a probe thrice, 1 s apart. A probe is not data, so srvLast is left untouched.
-func ack(c *net.UDPConn, to netip.AddrPort) {
+// ackWire is zero32 obfuscated for the listener's pair.
+func ack(c *net.UDPConn, to netip.AddrPort, ackWire []byte) {
 	for i := 0; i < 3; i++ {
-		if _, err := c.WriteToUDPAddrPort(zero32[:], to); err != nil {
+		if _, err := c.WriteToUDPAddrPort(ackWire, to); err != nil {
 			return
 		}
 		time.Sleep(time.Second)
@@ -259,7 +278,7 @@ func runClient(c *Config, s *sched) error {
 	}
 	appPC := tune(app)
 	var appPeer atomic.Pointer[net.UDPAddr]
-	var cur atomic.Pointer[ipv6.PacketConn]
+	var cur atomic.Pointer[chanState]
 
 	go func() { // app -> current channel
 		p := newPump()
@@ -278,9 +297,10 @@ func runClient(c *Config, s *sched) error {
 				continue
 			}
 			for i := 0; i < n; i++ {
+				p.xor(i, h.ks)
 				p.add(i, nil)
 			}
-			if err := p.flush(h); err != nil {
+			if err := p.flush(h.pc); err != nil {
 				logErr("send", err)
 			}
 		}
@@ -299,7 +319,7 @@ func runClient(c *Config, s *sched) error {
 		if old := chans[p]; old != nil {
 			time.AfterFunc(keepFor, func() { old.conn.Close() }) // let in-flight replies land
 		}
-		st := &chanState{conn: h, pc: tune(h), createdAt: T, probedAt: T, lastUse: T}
+		st := &chanState{conn: h, pc: tune(h), ks: keystream(c.Key, p), createdAt: T, probedAt: T, lastUse: T}
 		chans[p] = st
 		go func() { // replies on any live channel -> app
 			p := newPump()
@@ -317,6 +337,7 @@ func runClient(c *Config, s *sched) error {
 					continue
 				}
 				for i := 0; i < n; i++ {
+					p.xor(i, st.ks)
 					if p.seg[i] == 0 && isProbe(p.buf(i)) {
 						continue // ACK: liveness only
 					}
@@ -327,7 +348,7 @@ func runClient(c *Config, s *sched) error {
 				}
 			}
 		}()
-		if _, err := h.Write(zero32[:]); err != nil {
+		if _, err := h.Write(st.ks[:len(zero32)]); err != nil { // obfuscated zero32
 			logErr("probe "+p.String(), err)
 		}
 	}
@@ -375,7 +396,7 @@ func runClient(c *Config, s *sched) error {
 		}
 		if pick != nil {
 			pick.lastUse = T
-			cur.Store(pick.pc)
+			cur.Store(pick)
 		}
 
 		// 3. close channels unused for keepFor and outside the lookahead window
@@ -400,6 +421,7 @@ func runClient(c *Config, s *sched) error {
 type chanState struct {
 	conn                         *net.UDPConn
 	pc                           *ipv6.PacketConn
+	ks                           []byte       // keystream of the channel's pair
 	createdAt, probedAt, lastUse int64        // unix seconds
 	lastRecv                     atomic.Int64 // unix seconds of last datagram (data or ACK)
 }

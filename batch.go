@@ -6,6 +6,7 @@ package main
 // splitting segments.
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"log"
 	"net"
@@ -79,6 +80,19 @@ func (p *pump) read(c *ipv6.PacketConn) (int, error) {
 
 // buf is message i's payload: one datagram, or GRO-coalesced segments of seg[i] bytes (the last may be shorter).
 func (p *pump) buf(i int) []byte { return p.in[i].Buffers[0][:p.in[i].N] }
+
+// xor (de)obfuscates message i in place. Every datagram, including each GRO segment, starts at keystream offset 0.
+func (p *pump) xor(i int, ks []byte) {
+	b, s := p.buf(i), p.seg[i]
+	if s == 0 {
+		s = len(b)
+	}
+	for len(b) > 0 {
+		n := min(s, len(b))
+		subtle.XORBytes(b[:n], b[:n], ks)
+		b = b[n:]
+	}
+}
 
 // add queues in-message i for sending to `to`. Pass nil for a connected socket.
 func (p *pump) add(i int, to net.Addr) {

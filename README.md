@@ -13,7 +13,9 @@ Before switching, the client probes each upcoming host:port 5 s ahead with a 32-
 server acknowledges. Traffic goes only over channels that have proven alive, so dead addresses and blocked ports
 are skipped. As a side effect, an app datagram of exactly 32 zero bytes is treated as a probe and dropped.
 
-It does **not** encrypt or authenticate anything. If you need security, run a secure protocol
+Every datagram is obfuscated with a keystream derived from `key` and the server host:port, with zero bytes of
+overhead. This only hides inner-protocol headers from DPI. It does **not** encrypt securely (the keystream repeats)
+or authenticate anything. Both sides must run this version. If you need security, run a secure protocol
 (WireGuard, QUIC, …) inside the tunnel.
 
 It is Linux-only. Traffic is read and written in batches (recvmmsg/sendmmsg), with UDP GRO/GSO when the kernel
