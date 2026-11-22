@@ -10,6 +10,8 @@ import (
 	"encoding/binary"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"syscall"
 	"unsafe"
 
@@ -25,7 +27,57 @@ const (
 	sockBuf    = 4 << 20 // a full receive queue is where bursts get dropped
 	udpSegment = 103     // UDP_SEGMENT (GSO), Linux ≥ 4.18
 	udpGRO     = 104     // UDP_GRO, Linux ≥ 5.0
+	protoLite  = 136     // IPPROTO_UDPLITE
 )
+
+// udpSock opens p's socket, bound (listen) or connected (dial). For UDP-Lite, which package net lacks, it makes the
+// socket by hand and wraps it with FilePacketConn, which still returns a *net.UDPConn. UDP-Lite keeps the default
+// full checksum coverage, so the only difference from UDP is the IP protocol number.
+func udpSock(p pair, listen bool) (*net.UDPConn, error) {
+	if !p.lite {
+		if listen {
+			return net.ListenUDP("udp", net.UDPAddrFromAddrPort(p.AddrPort))
+		}
+		return net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(p.AddrPort))
+	}
+	var fam int
+	var sa syscall.Sockaddr
+	if a := p.Addr(); a.Is4() {
+		fam, sa = syscall.AF_INET, &syscall.SockaddrInet4{Port: int(p.Port()), Addr: a.As4()}
+	} else {
+		var zone int
+		if z := a.Zone(); z != "" { // numeric zone, else an interface name
+			var err error
+			if zone, err = strconv.Atoi(z); err != nil {
+				ifi, err := net.InterfaceByName(z)
+				if err != nil {
+					return nil, err
+				}
+				zone = ifi.Index
+			}
+		}
+		fam, sa = syscall.AF_INET6, &syscall.SockaddrInet6{Port: int(p.Port()), Addr: a.As16(), ZoneId: uint32(zone)}
+	}
+	fd, err := syscall.Socket(fam, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, protoLite)
+	if err != nil {
+		return nil, os.NewSyscallError("socket udplite", err)
+	}
+	f := os.NewFile(uintptr(fd), "udplite")
+	defer f.Close() // FilePacketConn dups the fd
+	if listen {
+		err = os.NewSyscallError("bind", syscall.Bind(fd, sa))
+	} else {
+		err = os.NewSyscallError("connect", syscall.Connect(fd, sa))
+	}
+	if err != nil {
+		return nil, err
+	}
+	c, err := net.FilePacketConn(f)
+	if err != nil {
+		return nil, err
+	}
+	return c.(*net.UDPConn), nil
+}
 
 // tune enlarges socket buffers and enables GRO, ignoring failures. SO_*BUFFORCE needs
 // CAP_NET_ADMIN (for example, root under systemd). Without it, the buffers are capped by
@@ -94,13 +146,14 @@ func (p *pump) xor(i int, ks []byte) {
 	}
 }
 
-// add queues in-message i for sending to `to`. Pass nil for a connected socket.
-func (p *pump) add(i int, to net.Addr) {
+// add queues in-message i for sending to `to`. Pass nil for a connected socket. Pass gso=false when the socket
+// is UDP-Lite, where the kernel refuses UDP_SEGMENT; coalesced buffers are then split.
+func (p *pump) add(i int, to net.Addr, gso bool) {
 	b, s := p.buf(i), p.seg[i]
 	switch {
 	case s == 0 || s >= len(b):
 		p.push(b, nil, to)
-	case !p.noGSO:
+	case gso && !p.noGSO:
 		p.push(b, gsoCmsg(p.gso[i], s), to)
 	default:
 		p.split(b, s, to)

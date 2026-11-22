@@ -35,6 +35,12 @@ tunnel. Each side logs `schedule fingerprint XXXXXXXX` at startup, so compare th
 }
 ```
 - `hosts` × `ports` (inclusive ranges) form the pair list, in file order. IPv4/IPv6/zoned addresses work.
+- A port given as a string with an `l` suffix (`["40000l", "40015l"]`) is **UDP-Lite** (IP proto 136, default full
+  checksum coverage). Both ends of a range need the same suffix. Package `net` lacks UDP-Lite, so `udpSock` (batch.go)
+  creates the socket with `syscall` and wraps it with `net.FilePacketConn`, which returns a normal `*net.UDPConn`.
+  The kernel refuses GSO sends on UDP-Lite, so coalesced buffers headed to a UDP-Lite socket are split (`add(…, gso=false)`).
+  UDP-Lite never gets GRO on receive. A pair prints as `host:portl`. That spelling feeds the fingerprint and the
+  keystream, so plain UDP pairs keep their old values.
 - `key` perturbs the schedule and keys the obfuscation. It is **not** a security measure.
 - `target` is used by the server only (the forward destination); `listen` by the client only (where the local app sends).
 
@@ -109,9 +115,10 @@ socket via `SO_REUSEPORT`, and `batchSize` tuning (memory cost: `batchSize` × 6
 
 ## Dev
 ```
-go vet ./... && go test -v ./...   # ~7 s; ports 47000-47003, 47100-47101; 192.0.2.1 = deliberately dead host
+go vet ./... && go test -v ./...   # ~7 s; ports 47000-47002 + 47000l, 47100-47102; 192.0.2.1 = deliberately dead host
 # tests: TestTunnel (dead pairs, probe leak, GSO burst → 10×100 B intact), TestClosedReadBatch (readers exit),
-#        TestObfuscate (per-pair keystream, per-segment XOR), TestPumpSplit
+#        TestObfuscate (per-pair keystream, per-segment XOR), TestPumpSplit, TestPorts ("l" parsing),
+#        TestLiteSock (real proto-136 socket round trip)
 CGO_ENABLED=0 go build -o hoptun .   # static binary, no glibc dependency
 ```
 Always build with `CGO_ENABLED=0`. Otherwise `net` links the cgo DNS resolver against the build

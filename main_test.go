@@ -2,18 +2,23 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
 
 func TestTunnel(t *testing.T) {
 	c := &Config{
-		Hosts:  []string{"127.0.0.1", "::1", "192.0.2.1"}, // 192.0.2.1: TEST-NET, unbindable => dead pairs
-		Ports:  [][2]int{{47000, 47003}},
+		Hosts: []string{"127.0.0.1", "::1", "192.0.2.1"}, // 192.0.2.1: TEST-NET, unbindable => dead pairs
+		// 47000l: same number, other protocol. Keep the pair count at 12: the schedule walks pairs nearly in order,
+		// so more ports per host would put more than lookahead+1 dead 192.0.2.1 slots in a row.
+		Ports:  [][2]port{{{47000, false}, {47002, false}}, {{47000, true}, {47000, true}}},
 		Key:    "test",
 		Target: "127.0.0.1:47100",
 		Listen: "[::1]:47101",
@@ -72,7 +77,7 @@ func TestTunnel(t *testing.T) {
 		app.Write([]byte("ping"))
 		time.Sleep(10 * time.Millisecond)
 		if p := srvLast.Load(); p != nil {
-			seen[p.c.LocalAddr().String()+"<"+p.a.String()] = true
+			seen[p.c.LocalAddr().String()+map[bool]string{true: "l"}[p.lt]+"<"+p.a.String()] = true
 		}
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -110,6 +115,60 @@ func TestTunnel(t *testing.T) {
 	}
 }
 
+func TestPorts(t *testing.T) {
+	var c Config
+	if err := json.Unmarshal([]byte(`{"hosts":["::1"],"ports":[[1,2],["3l","4l"],["5","5"]]}`), &c); err != nil {
+		t.Fatal(err)
+	}
+	s, err := newSched(&c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, p := range s.pairs {
+		got = append(got, p.String())
+	}
+	if fmt.Sprint(got) != "[[::1]:1 [::1]:2 [::1]:3l [::1]:4l [::1]:5]" {
+		t.Fatalf("pairs %v", got)
+	}
+	for _, bad := range []string{`[["1l",2]]`, `[["x","2"]]`} {
+		c := Config{Hosts: []string{"::1"}}
+		if json.Unmarshal([]byte(bad), &c.Ports) == nil {
+			if _, err := newSched(&c); err == nil {
+				t.Fatalf("%s accepted", bad)
+			}
+		}
+	}
+}
+
+func TestLiteSock(t *testing.T) { // a real UDP-Lite socket (IP protocol 136), round trip over IPv4 and IPv6
+	for _, a := range []string{"127.0.0.1:47102", "[::1]:47102"} {
+		p := pair{netip.MustParseAddrPort(a), true}
+		l, err := udpSock(p, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		d, err := udpSock(p, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		rc, _ := l.SyscallConn()
+		var proto int
+		rc.Control(func(fd uintptr) { proto, _ = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_PROTOCOL) })
+		if proto != protoLite {
+			t.Fatalf("%s: protocol %d, want %d", a, proto, protoLite)
+		}
+		d.Write([]byte("hi"))
+		buf := make([]byte, 8)
+		l.SetReadDeadline(time.Now().Add(time.Second))
+		if n, _, err := l.ReadFromUDPAddrPort(buf); err != nil || string(buf[:n]) != "hi" {
+			t.Fatalf("%s: read %q, %v", a, buf[:n], err)
+		}
+	}
+}
+
 func TestClosedReadBatch(t *testing.T) { // readers rely on this to exit instead of spinning
 	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
 	if err != nil {
@@ -123,7 +182,7 @@ func TestClosedReadBatch(t *testing.T) { // readers rely on this to exit instead
 }
 
 func TestObfuscate(t *testing.T) { // per-pair keystreams; a GRO buffer is (de)obfuscated per segment
-	a, b := netip.MustParseAddrPort("127.0.0.1:1"), netip.MustParseAddrPort("127.0.0.1:2")
+	a, b := pair{netip.MustParseAddrPort("127.0.0.1:1"), false}, pair{netip.MustParseAddrPort("127.0.0.1:1"), true} // same host:port, UDP vs UDP-Lite
 	ka, kb := keystream("k", a), keystream("k", b)
 	if bytes.Equal(ka[:32], kb[:32]) || bytes.Equal(ka[:32], zero32[:]) {
 		t.Fatal("keystreams must differ per pair and from zero")
@@ -145,12 +204,17 @@ func TestObfuscate(t *testing.T) { // per-pair keystreams; a GRO buffer is (de)o
 func TestPumpSplit(t *testing.T) { // coalesced buffer: GSO keeps it whole, the noGSO fallback splits on segment boundaries
 	p := newPump()
 	p.in[0].N, p.seg[0] = 250, 100
-	p.add(0, nil)
+	p.add(0, nil, true)
 	if len(p.out) != 1 || p.out[0].OOB == nil || len(p.out[0].Buffers[0]) != 250 {
 		t.Fatalf("GSO: %d msgs", len(p.out))
 	}
+	p.out = p.out[:0]
+	p.add(0, nil, false) // UDP-Lite destination: split
+	if len(p.out) != 3 || p.out[0].OOB != nil {
+		t.Fatalf("gso=false: %d msgs", len(p.out))
+	}
 	p.out, p.noGSO = p.out[:0], true
-	p.add(0, nil)
+	p.add(0, nil, true)
 	if len(p.out) != 3 || len(p.out[0].Buffers[0]) != 100 || len(p.out[2].Buffers[0]) != 50 || p.out[1].OOB != nil {
 		t.Fatalf("split: %d msgs", len(p.out))
 	}

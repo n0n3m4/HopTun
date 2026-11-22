@@ -40,6 +40,9 @@ Copy the same file to both sides:
 ```
 - `hosts` × `ports` (inclusive ranges) is the set of server addresses to hop over. The server
   must have these IPs configured on its interfaces.
+- A port written as a string with an `l` suffix uses UDP-Lite (IP protocol 136) in place of UDP, for example
+  `[[40000, 40015], ["40000l", "40015l"]]`. Both ends of a range need the same suffix. UDP-Lite traffic must be allowed
+  through firewalls separately (for example `-p udplite` in iptables).
 - `target` is server-only: datagrams are forwarded there.
 - `listen` is client-only: the local app sends here.
 - Both sides need clocks synced to within about a minute. Each logs a `schedule fingerprint` at

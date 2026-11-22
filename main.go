@@ -19,6 +19,8 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -45,15 +47,48 @@ var zero32 [32]byte
 func isProbe(b []byte) bool { return bytes.Equal(b, zero32[:]) }
 
 type Config struct {
-	Hosts  []string `json:"hosts"`
-	Ports  [][2]int `json:"ports"` // inclusive ranges
-	Key    string   `json:"key"`
-	Target string   `json:"target"` // server only: where datagrams are forwarded
-	Listen string   `json:"listen"` // client only: where the local app sends
+	Hosts  []string  `json:"hosts"`
+	Ports  [][2]port `json:"ports"` // inclusive ranges
+	Key    string    `json:"key"`
+	Target string    `json:"target"` // server only: where datagrams are forwarded
+	Listen string    `json:"listen"` // client only: where the local app sends
+}
+
+// port is a config port: a JSON number, or a string with an "l" suffix for UDP-Lite ("40000l").
+type port struct {
+	n    int
+	lite bool
+}
+
+func (p *port) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) != nil {
+		s = string(b) // a plain number
+	}
+	s, p.lite = strings.CutSuffix(s, "l")
+	var err error
+	if p.n, err = strconv.Atoi(s); err != nil {
+		return fmt.Errorf(`port %s: want a number, or a string like "40000l" for UDP-Lite`, b)
+	}
+	return nil
+}
+
+// pair is one schedule slot: a server host:port, over UDP or UDP-Lite.
+type pair struct {
+	netip.AddrPort
+	lite bool
+}
+
+// String is the config spelling. It feeds the fingerprint and the keystream, and plain UDP pairs are unchanged.
+func (p pair) String() string {
+	if p.lite {
+		return p.AddrPort.String() + "l"
+	}
+	return p.AddrPort.String()
 }
 
 type sched struct {
-	pairs []netip.AddrPort
+	pairs []pair
 	seed  uint64 // FNV-1a state after hashing the key
 }
 
@@ -83,13 +118,13 @@ func newSched(c *Config) (*sched, error) {
 	if len(c.Hosts) == 0 || len(c.Ports) == 0 {
 		return nil, errors.New("config: hosts and ports must be non-empty")
 	}
-	var ports []uint16
+	var ports []port
 	for _, r := range c.Ports {
-		if r[0] < 1 || r[1] > 65535 || r[0] > r[1] {
-			return nil, fmt.Errorf("config: bad port range %v", r)
+		if r[0].n < 1 || r[1].n > 65535 || r[0].n > r[1].n || r[0].lite != r[1].lite {
+			return nil, fmt.Errorf("config: bad port range %v (both ends need the same \"l\" suffix)", r)
 		}
-		for p := r[0]; p <= r[1]; p++ {
-			ports = append(ports, uint16(p))
+		for n := r[0].n; n <= r[1].n; n++ {
+			ports = append(ports, port{n, r[0].lite})
 		}
 	}
 	s := &sched{seed: fnv(fnvOffset, []byte(c.Key))}
@@ -99,25 +134,25 @@ func newSched(c *Config) (*sched, error) {
 			return nil, fmt.Errorf("config: %w", err)
 		}
 		for _, p := range ports {
-			s.pairs = append(s.pairs, netip.AddrPortFrom(a.Unmap(), p))
+			s.pairs = append(s.pairs, pair{netip.AddrPortFrom(a.Unmap(), uint16(p.n)), p.lite})
 		}
 	}
 	return s, nil
 }
 
 // hp is the shared schedule: HP(t) for t in UTC unix seconds.
-func (s *sched) hp(t int64) netip.AddrPort {
+func (s *sched) hp(t int64) pair {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], uint64(t))
 	return s.pairs[fnv(s.seed, b[:])%uint64(len(s.pairs))]
 }
 
 // keystream obfuscates every datagram on pair ap, probes and ACKs included: AES-128-CTR keyed by
-// SHA-256(key ‖ ap) with a fixed zero IV, so there are no per-packet bytes. Obfuscation against DPI, not security:
+// SHA-256(key ‖ p) with a fixed zero IV, so there are no per-packet bytes. Obfuscation against DPI, not security:
 // the keystream repeats for every packet on the pair (see CLAUDE.md).
 // ponytail: bufSize (64 KiB) per pair, about 11 MiB for a server with 180 listeners.
-func keystream(key string, ap netip.AddrPort) []byte {
-	k := sha256.Sum256([]byte(key + "\x00" + ap.String()))
+func keystream(key string, p pair) []byte {
+	k := sha256.Sum256([]byte(key + "\x00" + p.String()))
 	b, _ := aes.NewCipher(k[:16]) // cannot fail for a 16-byte key
 	ks := make([]byte, bufSize)
 	cipher.NewCTR(b, make([]byte, aes.BlockSize)).XORKeyStream(ks, ks)
@@ -151,6 +186,7 @@ type path struct {
 	a  netip.AddrPort
 	ua *net.UDPAddr // a, preconverted for WriteBatch
 	ks []byte       // keystream of the listener's pair
+	lt bool         // the listener is UDP-Lite: no GSO
 }
 
 // srvLast is where replies go: the socket+peer the latest datagram came in on.
@@ -181,7 +217,7 @@ func runServer(c *Config, s *sched) error {
 			}
 			for i := 0; i < n; i++ {
 				p.xor(i, dst.ks)
-				p.add(i, dst.ua)
+				p.add(i, dst.ua, !dst.lt)
 			}
 			if err := p.flush(dst.pc); err != nil {
 				logErr("reply", err)
@@ -189,11 +225,11 @@ func runServer(c *Config, s *sched) error {
 		}
 	}()
 
-	open := map[netip.AddrPort]*net.UDPConn{}
+	open := map[pair]*net.UDPConn{}
 	for {
 		now := time.Now()
 		m := now.Truncate(time.Minute).Unix()
-		want := map[netip.AddrPort]bool{}
+		want := map[pair]bool{}
 		for t := m - 60; t < m+120; t++ { // current minute ±1 for clock skew
 			want[s.hp(t)] = true
 		}
@@ -207,19 +243,19 @@ func runServer(c *Config, s *sched) error {
 			if open[ap] != nil {
 				continue
 			}
-			conn, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(ap))
+			conn, err := udpSock(ap, true)
 			if err != nil {
 				logErr("listen "+ap.String(), err)
 				continue
 			}
 			open[ap] = conn
-			go serveListener(conn, tune(conn), upPC, keystream(c.Key, ap))
+			go serveListener(conn, tune(conn), upPC, keystream(c.Key, ap), ap.lite)
 		}
 		time.Sleep(time.Until(now.Truncate(time.Minute).Add(time.Minute)))
 	}
 }
 
-func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn, ks []byte) {
+func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn, ks []byte, lite bool) {
 	p := newPump()
 	for {
 		n, err := p.read(pc)
@@ -240,13 +276,13 @@ func serveListener(c *net.UDPConn, pc, up *ipv6.PacketConn, ks []byte) {
 				continue
 			}
 			from = a
-			p.add(i, nil)
+			p.add(i, nil, true)
 		}
 		if from == nil {
 			continue
 		}
 		if ap := from.AddrPort(); func() bool { l := srvLast.Load(); return l == nil || l.c != c || l.a != ap }() {
-			srvLast.Store(&path{c, pc, ap, from, ks})
+			srvLast.Store(&path{c, pc, ap, from, ks, lite})
 		}
 		if err := p.flush(up); err != nil {
 			logErr("forward", err)
@@ -298,7 +334,7 @@ func runClient(c *Config, s *sched) error {
 			}
 			for i := 0; i < n; i++ {
 				p.xor(i, h.ks)
-				p.add(i, nil)
+				p.add(i, nil, !h.p.lite)
 			}
 			if err := p.flush(h.pc); err != nil {
 				logErr("send", err)
@@ -307,11 +343,11 @@ func runClient(c *Config, s *sched) error {
 	}()
 
 	// Per-pair channels, owned by this goroutine; readers touch only lastRecv.
-	chans := map[netip.AddrPort]*chanState{}
+	chans := map[pair]*chanState{}
 
 	// open replaces p's channel with a fresh socket (fresh NAT mapping) and probes it.
-	open := func(p netip.AddrPort, T int64) {
-		h, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(p))
+	open := func(p pair, T int64) {
+		h, err := udpSock(p, false)
 		if err != nil {
 			logErr("dial "+p.String(), err)
 			return
@@ -319,7 +355,7 @@ func runClient(c *Config, s *sched) error {
 		if old := chans[p]; old != nil {
 			time.AfterFunc(keepFor, func() { old.conn.Close() }) // let in-flight replies land
 		}
-		st := &chanState{conn: h, pc: tune(h), ks: keystream(c.Key, p), createdAt: T, probedAt: T, lastUse: T}
+		st := &chanState{p: p, conn: h, pc: tune(h), ks: keystream(c.Key, p), createdAt: T, probedAt: T, lastUse: T}
 		chans[p] = st
 		go func() { // replies on any live channel -> app
 			p := newPump()
@@ -341,7 +377,7 @@ func runClient(c *Config, s *sched) error {
 					if p.seg[i] == 0 && isProbe(p.buf(i)) {
 						continue // ACK: liveness only
 					}
-					p.add(i, peer)
+					p.add(i, peer, true)
 				}
 				if err := p.flush(appPC); err != nil {
 					logErr("deliver", err)
@@ -419,6 +455,7 @@ func runClient(c *Config, s *sched) error {
 }
 
 type chanState struct {
+	p                            pair
 	conn                         *net.UDPConn
 	pc                           *ipv6.PacketConn
 	ks                           []byte       // keystream of the channel's pair
